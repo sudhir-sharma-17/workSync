@@ -46,9 +46,39 @@ async def run_submission(batch_id: str, mode: str, session_id: str):
             await session.commit()
             return
 
+        if mode in ("browser_validation", "browser_dry_run"):
+            mode = "dry_run"
+
         if mode == "test":
             cap = 5
             pending = pending[:cap]
+
+        # Synchronize pending records with confirmed project mappings from batch.debug_meta
+        if batch.debug_meta:
+            try:
+                import json
+                from sqlalchemy import update
+                debug_data = json.loads(batch.debug_meta)
+                resolutions = debug_data.get("project_resolution", [])
+                mapping_dict = {}
+                for r in resolutions:
+                    inp = (r.get("input_project") or "").strip().lower()
+                    resolved = (r.get("resolved_project") or "").strip()
+                    if inp and resolved and (r.get("confidence", 0) >= 80 or r.get("status") == "Auto-Accepted"):
+                        mapping_dict[inp] = resolved
+
+                updated_any = False
+                for rec in pending:
+                    cur_proj = (rec.project_name or "").strip()
+                    if cur_proj.lower() in mapping_dict:
+                        canonical = mapping_dict[cur_proj.lower()]
+                        if rec.project_name != canonical:
+                            rec.project_name = canonical
+                            updated_any = True
+                if updated_any:
+                    await session.flush()
+            except Exception as e:
+                logger.warning(f"Error syncing debug_meta project mappings in run_submission: {e}")
 
         # Bulk-fetch BOQ mappings
         mappings_res = await session.execute(select(WorkerMapping).where(WorkerMapping.session_id == session_id))

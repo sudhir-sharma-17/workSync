@@ -291,19 +291,52 @@ async def run_automation(
             "batch_id": req.batch_id,
         }
 
-    # Dry run — no Playwright, just count
-    if req.mode == "dry_run":
+    # Count-only preview mode (backward compatible) — no browser opened
+    if req.mode == "count_only":
         return {
-            "mode": "dry_run",
-            "message": "Dry run complete — no submissions made.",
+            "mode": "count_only",
+            "message": "Count-only preview complete: no browser launched and no form submissions made.",
+            "count_only": True,
             "would_submit": len(pending),
             "batch_id": req.batch_id,
         }
 
-    # Apply limit for test mode
-    if req.mode == "test":
+    # Browser validation (dry run) vs test vs production
+    engine_mode = "dry_run" if req.mode in ("dry_run", "browser_validation", "browser_dry_run") else req.mode
+
+    # Apply limit for test mode (or dry_run if explicitly limited)
+    if engine_mode == "test":
         cap = req.limit or 5
         pending = pending[:cap]
+    elif engine_mode == "dry_run" and req.limit:
+        pending = pending[:req.limit]
+
+    # Synchronize pending records with confirmed project mappings from batch.debug_meta
+    if batch.debug_meta:
+        try:
+            import json
+            from sqlalchemy import update
+            debug_data = json.loads(batch.debug_meta)
+            resolutions = debug_data.get("project_resolution", [])
+            mapping_dict = {}
+            for r in resolutions:
+                inp = (r.get("input_project") or "").strip().lower()
+                resolved = (r.get("resolved_project") or "").strip()
+                if inp and resolved and (r.get("confidence", 0) >= 80 or r.get("status") == "Auto-Accepted"):
+                    mapping_dict[inp] = resolved
+
+            updated_any = False
+            for rec in pending:
+                cur_proj = (rec.project_name or "").strip()
+                if cur_proj.lower() in mapping_dict:
+                    canonical = mapping_dict[cur_proj.lower()]
+                    if rec.project_name != canonical:
+                        rec.project_name = canonical
+                        updated_any = True
+            if updated_any:
+                await db.flush()
+        except Exception as e:
+            logger.warning(f"Error syncing debug_meta project mappings in run_automation: {e}")
 
     # Bulk-fetch BOQ mappings
     mappings_res = await db.execute(select(WorkerMapping).where(WorkerMapping.session_id == session_id))
@@ -340,15 +373,16 @@ async def run_automation(
         python_exe,
         script_path,
         "--batch-id", req.batch_id,
-        "--mode", req.mode,
+        "--mode", engine_mode,
         "--session-id", session_id
     ])
 
+    mode_label = "Browser validation (dry run)" if engine_mode == "dry_run" else f"Submission ({engine_mode})"
     return {
-        "mode": req.mode,
+        "mode": engine_mode,
         "batch_id": req.batch_id,
         "queued": len(records_payload),
-        "message": f"{len(records_payload)} records queued for submission. Poll /status/{req.batch_id} for live progress.",
+        "message": f"{len(records_payload)} records queued for {mode_label}. Poll /status/{req.batch_id} for live progress.",
     }
 
 
@@ -407,24 +441,50 @@ async def get_batch_status(
     total = len(records)
     n_submitted = sum(1 for r in records if r.status == "Submitted")
     n_failed = sum(1 for r in records if r.status == "Failed")
+    n_needs_review = sum(1 for r in records if r.status in ("Needs Review", "Uncertain"))
     n_pending = sum(1 for r in records if r.status == "Pending")
 
-    # Fetch recent submission results for live logs
+    # Fetch submission results for live logs and dry-run stats
     rec_ids = [str(r.id) for r in records]
-    results_res = await db.execute(
-        select(SubmissionResult)
-        .where(
-            SubmissionResult.record_id.in_(rec_ids),
-            SubmissionResult.session_id == session_id,
+    all_results = []
+    if rec_ids:
+        results_res = await db.execute(
+            select(SubmissionResult)
+            .where(
+                SubmissionResult.record_id.in_(rec_ids),
+                SubmissionResult.session_id == session_id,
+            )
+            .order_by(SubmissionResult.timestamp.desc())
         )
-        .order_by(SubmissionResult.timestamp.desc())
-        .limit(20)
-    )
-    recent_results = results_res.scalars().all()
+        all_results = results_res.scalars().all()
+
+    # Dry-run verified IDs
+    dry_run_verified_ids = {
+        r.record_id for r in all_results
+        if r.status == "Success" and "[Dry Run]" in (r.error_message or "")
+    }
+    n_dry_run_verified = len(dry_run_verified_ids)
+
+    # Calculate terminal progress percentage
+    if batch.status in ("Completed", "Cancelled", "Failed"):
+        if batch.status == "Completed":
+            progress_pct = 100
+        else:
+            processed = n_submitted + n_failed + n_needs_review + (n_dry_run_verified if n_submitted == 0 else 0)
+            progress_pct = min(100, round(processed / total * 100)) if total > 0 else 0
+    else:
+        processed = n_submitted + n_failed + n_needs_review + (n_dry_run_verified if n_submitted == 0 else 0)
+        progress_pct = min(100, round(processed / total * 100)) if total > 0 else 0
+
     logs = []
-    for r in reversed(recent_results):
+    for r in reversed(all_results[:20]):
         if r.status == "Success":
-            logs.append(f"[PLAYWRIGHT]: ✓ {r.worker_name} @ {r.project_name} ({r.attendance_date})")
+            if "[Dry Run]" in (r.error_message or ""):
+                logs.append(f"[DRY RUN]: ✓ {r.worker_name} @ {r.project_name} ({r.attendance_date}) - Verified")
+            else:
+                logs.append(f"[PLAYWRIGHT]: ✓ {r.worker_name} @ {r.project_name} ({r.attendance_date})")
+        elif r.status in ("Needs Review", "Uncertain"):
+            logs.append(f"[NEEDS REVIEW]: ⚠ {r.worker_name} @ {r.project_name} — {r.error_message or 'Review required'}")
         else:
             logs.append(f"[ERROR]: ✗ {r.worker_name} — {r.error_message or 'Unknown error'}")
 
@@ -434,7 +494,10 @@ async def get_batch_status(
         "total": total,
         "submitted": n_submitted,
         "failed": n_failed,
+        "needs_review": n_needs_review,
+        "uncertain": n_needs_review,
+        "dry_run_verified": n_dry_run_verified,
         "pending": n_pending,
-        "progress_pct": round((n_submitted + n_failed) / total * 100) if total > 0 else 0,
+        "progress_pct": progress_pct,
         "logs": logs,
     }

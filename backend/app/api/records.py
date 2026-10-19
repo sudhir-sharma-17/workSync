@@ -241,57 +241,81 @@ async def save_project_alias(
 ):
     """Saves a global project alias mapping and bulk-updates all records in the batch with matching input project name."""
     from app.db.models import ProjectAlias
+    from sqlalchemy import update, func, or_
     
-    # 1. Upsert global alias dictionary
-    res_alias = await db.execute(select(ProjectAlias).where(ProjectAlias.input_project == req.input_project))
+    clean_input = req.input_project.strip()
+    clean_resolved = req.resolved_project.strip()
+
+    # 1. Upsert global alias dictionary (case-insensitive search)
+    res_alias = await db.execute(
+        select(ProjectAlias).where(func.lower(ProjectAlias.input_project) == clean_input.lower())
+    )
     alias = res_alias.scalar_one_or_none()
     if not alias:
         alias = ProjectAlias(
-            input_project=req.input_project,
-            resolved_project=req.resolved_project
+            input_project=clean_input,
+            resolved_project=clean_resolved
         )
         db.add(alias)
     else:
-        alias.resolved_project = req.resolved_project
+        alias.input_project = clean_input
+        alias.resolved_project = clean_resolved
 
     # 2. Get batch to read debug_meta and find previous resolved project name
-    batch_res = await db.execute(select(UploadBatch).where(UploadBatch.id == req.batch_id, UploadBatch.session_id == session_id))
+    batch_res = await db.execute(
+        select(UploadBatch).where(UploadBatch.id == req.batch_id, UploadBatch.session_id == session_id)
+    )
     batch = batch_res.scalar_one_or_none()
     if not batch:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found.")
 
-    prev_resolved = req.input_project
-    resolutions = []
+    prev_resolved = None
+    names_to_match = {clean_input}
     if batch.debug_meta:
         try:
             debug_data = json.loads(batch.debug_meta)
             resolutions = debug_data.get("project_resolution", [])
+            found = False
             for r in resolutions:
-                if r.get("input_project") == req.input_project:
+                if (r.get("input_project") or "").strip().lower() == clean_input.lower():
                     prev_resolved = r.get("resolved_project")
-                    r["resolved_project"] = req.resolved_project
+                    r["resolved_project"] = clean_resolved
                     r["confidence"] = 100
                     r["status"] = "Auto-Accepted"
                     r["match_type"] = "Manual Correction"
+                    found = True
+            if not found:
+                resolutions.append({
+                    "input_project": clean_input,
+                    "resolved_project": clean_resolved,
+                    "confidence": 100,
+                    "status": "Auto-Accepted",
+                    "match_type": "Manual Correction"
+                })
+            debug_data["project_resolution"] = resolutions
             batch.debug_meta = json.dumps(debug_data)
         except Exception:
             pass
 
-    # 3. Bulk update all records in the batch having either input_project or prev_resolved as project_name
-    from sqlalchemy import update
-    stmt = (
-        update(AttendanceRecord)
-        .where(
-            AttendanceRecord.batch_id == req.batch_id,
-            AttendanceRecord.session_id == session_id,
-            AttendanceRecord.project_name.in_([req.input_project, prev_resolved])
+    if prev_resolved and prev_resolved.strip():
+        names_to_match.add(prev_resolved.strip())
+
+    # 3. Bulk update all records in the batch having matching project_name (case-insensitive)
+    conditions = [func.lower(AttendanceRecord.project_name) == n.lower() for n in names_to_match if n]
+    if conditions:
+        stmt = (
+            update(AttendanceRecord)
+            .where(
+                AttendanceRecord.batch_id == req.batch_id,
+                AttendanceRecord.session_id == session_id,
+                or_(*conditions)
+            )
+            .values(project_name=clean_resolved)
         )
-        .values(project_name=req.resolved_project)
-    )
-    await db.execute(stmt)
+        await db.execute(stmt)
     await db.commit()
 
-    return {"status": "success", "message": f"Global alias saved. Bulk updated batch records to {req.resolved_project}."}
+    return {"status": "success", "message": f"Global alias saved. Bulk updated batch records to {clean_resolved}."}
 
 
 @router.post("/worker-alias")

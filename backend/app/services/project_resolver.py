@@ -62,8 +62,6 @@ class ProjectResolver:
                 try:
                     options = json.loads(field.options)
                     if options:
-                        if "Sobha Royal Pavilion" not in options and not any(o.lower() == "sobha royal pavilion" for o in options):
-                            options.append("Sobha Royal Pavilion")
                         logger.info(f"[Resolver] Catalog cache HIT for form: {form_url}")
                         return options
                 except Exception as e:
@@ -73,9 +71,7 @@ class ProjectResolver:
         logger.info(f"[Resolver] Catalog cache MISS or Refresh. Scraping form: {form_url}")
         scraped_options = await self._scrape_project_options(form_url)
         if not scraped_options:
-            scraped_options = ["Sobha Royal Pavilion"]
-        elif "Sobha Royal Pavilion" not in scraped_options and not any(o.lower() == "sobha royal pavilion" for o in scraped_options):
-            scraped_options.append("Sobha Royal Pavilion")
+            scraped_options = []
 
         # 3. Save / Update cache in DB
         # Look for existing profile for current session
@@ -240,51 +236,64 @@ class ProjectResolver:
         resolutions = {}
 
         for inp in unique_inputs:
-            # Check Learning Alias Dictionary first
-            if inp in aliases:
-                resolved = aliases[inp]
-                if resolved in catalog:
-                    resolutions[inp] = {
-                        "input_project": inp,
-                        "resolved_project": resolved,
-                        "confidence": 100,
-                        "status": "Auto-Accepted",
-                        "match_type": "Learned Alias"
-                    }
-                    continue
+            # Check Learning Alias Dictionary first (case-insensitive lookup)
+            inp_clean = inp.strip().lower()
+            matched_alias = next((v for k, v in aliases.items() if k.strip().lower() == inp_clean), None)
+            if matched_alias and matched_alias in catalog:
+                resolutions[inp] = {
+                    "input_project": inp,
+                    "resolved_project": matched_alias,
+                    "confidence": 100,
+                    "status": "Auto-Accepted",
+                    "match_type": "Learned Alias"
+                }
+                continue
 
-            # Matching Pipeline
-            best_match = None
-            best_score = 0
-            best_match_type = ""
+            # Level 1: Exact Match
+            exact_match = next((t for t in catalog if t.strip().lower() == inp_clean), None)
+            if exact_match:
+                resolutions[inp] = {
+                    "input_project": inp,
+                    "resolved_project": exact_match,
+                    "confidence": 100,
+                    "status": "Auto-Accepted",
+                    "match_type": "Exact Match"
+                }
+                continue
 
             inp_norm = normalize_name(inp)
             inp_tokens = get_tokens(inp)
 
+            # Check for multiple prefix/containment matches in catalog (ambiguity check)
+            contained_targets = [
+                t for t in catalog
+                if len(inp_norm) >= 4 and inp_norm in normalize_name(t)
+            ]
+            token_contained_targets = [
+                t for t in catalog
+                if len(inp_tokens) >= 2 and all(tok in get_tokens(t) for tok in inp_tokens)
+            ]
+            ambiguous_candidates = list(dict.fromkeys(contained_targets + token_contained_targets))
+
+            # Matching Pipeline for fuzzy/token scoring
+            scored_targets = []
             for target in catalog:
                 target_norm = normalize_name(target)
                 target_tokens = get_tokens(target)
 
-                # Level 1: Exact Match
-                if inp.lower() == target.lower():
-                    best_match = target
-                    best_score = 100
-                    best_match_type = "Exact Match"
-                    break
-
-                # Level 2: Normalized Match
+                # Normalized Match
                 if inp_norm == target_norm:
-                    if best_score < 95:
-                        best_match = target
-                        best_score = 95
-                        best_match_type = "Normalized Match"
+                    scored_targets.append({
+                        "target": target,
+                        "score": 95,
+                        "match_type": "Normalized Match"
+                    })
+                    continue
 
-                # Level 3 & 4: Token Overlap & Fuzzy Similarity
-                # Compute token overlap
+                # Token Overlap & Fuzzy Similarity
                 matching_tokens = set(inp_tokens) & set(target_tokens)
                 token_overlap_ratio = len(matching_tokens) / max(len(inp_tokens), 1)
-                
-                # Check for numerical token match (crucial for projects like SYCON 61 vs SYCON_C61)
+
                 inp_numbers = [t for t in inp_tokens if t.isdigit()]
                 num_penalty = 0
                 if inp_numbers:
@@ -294,42 +303,65 @@ class ProjectResolver:
                     else:
                         num_penalty = 20
 
-                # Check token containment (e.g. 'sycon' in 'sycon_c61' or '61' in 'c61')
                 contained_tokens = [t for t in inp_tokens if t in target_norm]
                 token_overlap_ratio = len(contained_tokens) / max(len(inp_tokens), 1)
 
-
-                # Fuzzy matches via rapidfuzz
                 fuzzy_ratio = fuzz.ratio(inp_norm, target_norm)
                 fuzzy_wratio = fuzz.WRatio(inp.lower(), target.lower())
-                
+
                 token_boost = 10 if token_overlap_ratio == 1.0 else 0
-                
-                # Weighted score
+
                 score = (fuzzy_ratio * 0.35) + (fuzzy_wratio * 0.35) + (token_overlap_ratio * 20) + num_penalty + token_boost
                 score = min(max(int(score), 0), 100)
 
+                scored_targets.append({
+                    "target": target,
+                    "score": score,
+                    "match_type": "Fuzzy / Weighted Match"
+                })
 
-                if score > best_score:
-                    best_match = target
-                    best_score = score
-                    best_match_type = "Fuzzy / Weighted Match"
+            candidates = sorted(scored_targets, key=lambda x: x["score"], reverse=True)
+            top = candidates[0] if candidates else None
+            second = candidates[1] if len(candidates) > 1 else None
 
-            # Determine confidence status
-            if best_score >= 90:
-                status = "Auto-Accepted"
-            elif best_score >= 80:
-                status = "Smart Match"
+            # Detect ambiguity: multiple containment matches OR top two close high scores
+            is_ambiguous = False
+            if len(ambiguous_candidates) > 1:
+                is_ambiguous = True
+            elif top and second and top["score"] >= 75 and second["score"] >= 75 and (top["score"] - second["score"]) <= 6:
+                is_ambiguous = True
+
+            if is_ambiguous:
+                resolutions[inp] = {
+                    "input_project": inp,
+                    "resolved_project": "",
+                    "confidence": 0,
+                    "status": "Needs Review",
+                    "match_type": "Ambiguous Match (Manual Selection Required)"
+                }
+            elif top:
+                if top["score"] >= 90:
+                    status = "Auto-Accepted"
+                elif top["score"] >= 80:
+                    status = "Smart Match"
+                else:
+                    status = "Needs Review"
+
+                resolutions[inp] = {
+                    "input_project": inp,
+                    "resolved_project": top["target"],
+                    "confidence": top["score"],
+                    "status": status,
+                    "match_type": top["match_type"]
+                }
             else:
-                status = "Needs Review"
-
-            resolutions[inp] = {
-                "input_project": inp,
-                "resolved_project": best_match if best_match else inp,
-                "confidence": best_score,
-                "status": status,
-                "match_type": best_match_type
-            }
+                resolutions[inp] = {
+                    "input_project": inp,
+                    "resolved_project": inp,
+                    "confidence": 0,
+                    "status": "Needs Review",
+                    "match_type": "No Catalog Match"
+                }
 
         # 5. Apply resolutions to raw_records
         resolved_records = []
@@ -339,7 +371,8 @@ class ProjectResolver:
             if inp_proj in resolutions:
                 res_info = resolutions[inp_proj]
                 # Only automatically resolve if auto-accept or smart match (>= 80% confidence)
-                if res_info["confidence"] >= 80:
+                # and resolved_project is non-empty
+                if res_info["confidence"] >= 80 and res_info["resolved_project"]:
                     rec_copy["project_name"] = res_info["resolved_project"]
             resolved_records.append(rec_copy)
 
