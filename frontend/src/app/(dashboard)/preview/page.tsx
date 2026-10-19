@@ -57,6 +57,9 @@ interface BatchStatus {
   total: number;
   submitted: number;
   failed: number;
+  needs_review?: number;
+  uncertain?: number;
+  dry_run_verified?: number;
   pending: number;
   progress_pct: number;
   logs: string[];
@@ -109,7 +112,8 @@ export default function PreviewPage() {
   const [validationReport, setValidationReport] = useState<ValidationReport | null>(null);
 
   // Submission flow
-  const [mode, setMode] = useState<"dry_run" | "test" | "production">("test");
+  type SubmissionMode = "count_only" | "dry_run" | "test" | "production";
+  const [mode, setMode] = useState<SubmissionMode>("test");
   type FlowStatus = "idle" | "validated" | "submitting" | "completed" | "cancelled" | "failed";
   const [flowStatus, setFlowStatus] = useState<FlowStatus>("idle");
 
@@ -189,9 +193,6 @@ export default function PreviewPage() {
               const rawCatalog = catalogData.catalog || [];
               const durationPatterns = [/^\d+-\d+\s*hours?$/i, /^ot\s*\(/i];
               const filtered = rawCatalog.filter((p: string) => !durationPatterns.some((pat) => pat.test(p)));
-              if (!filtered.some((p: string) => p.toLowerCase() === "sobha royal pavilion")) {
-                filtered.push("Sobha Royal Pavilion");
-              }
               setProjectCatalog(filtered);
             }
           } catch (e) {
@@ -320,11 +321,21 @@ export default function PreviewPage() {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || "Failed to start submission.");
       }
-      if (mode !== "dry_run") startPolling();
-      else {
+      if (mode === "count_only") {
         const data = await res.json();
-        setLiveStatus({ batch_status: "Completed", total: data.would_submit, submitted: data.would_submit, failed: 0, pending: 0, progress_pct: 100, logs: ["[DRY RUN]: No actual submissions made."] });
+        setLiveStatus({
+          batch_status: "Completed",
+          total: data.would_submit,
+          submitted: 0,
+          failed: 0,
+          needs_review: 0,
+          pending: data.would_submit,
+          progress_pct: 100,
+          logs: [`[COUNT ONLY]: ${data.would_submit} pending records ready for submission. No browser opened.`]
+        });
         setFlowStatus("completed");
+      } else {
+        startPolling();
       }
     } catch (err: any) {
       setFlowStatus("failed");
@@ -366,8 +377,58 @@ export default function PreviewPage() {
     }
   };
 
-  const handleAliasMappingCorrection = async (inputProject: string, resolvedProject: string) => {
-    if (!resolvedProject) return;
+  const handleAliasMappingCorrection = async (inputProject: string, newProject: string) => {
+    if (!newProject) return;
+
+    // Determine previous resolved project for matching
+    const prevResolved = debugMeta?.project_resolution?.find(
+      (r: any) => (r.input_project || "").toLowerCase() === inputProject.toLowerCase()
+    )?.resolved_project;
+
+    // 1. Immediate UI state update (optimistic update)
+    setDebugMeta((prev: any) => {
+      if (!prev) return prev;
+      const currentResolutions = prev.project_resolution || [];
+      let found = false;
+      const updatedResolutions = currentResolutions.map((r: any) => {
+        if ((r.input_project || "").toLowerCase() === inputProject.toLowerCase()) {
+          found = true;
+          return {
+            ...r,
+            resolved_project: newProject,
+            confidence: 100,
+            status: "Auto-Accepted",
+            match_type: "Manual Selection",
+          };
+        }
+        return r;
+      });
+      if (!found) {
+        updatedResolutions.push({
+          input_project: inputProject,
+          resolved_project: newProject,
+          confidence: 100,
+          status: "Auto-Accepted",
+          match_type: "Manual Selection",
+        });
+      }
+      return { ...prev, project_resolution: updatedResolutions };
+    });
+
+    // Immediately update preview records in UI state
+    setRecords((prevRecords) =>
+      prevRecords.map((rec) => {
+        const curProj = (rec.project_name || "").toLowerCase();
+        const matchesInput = curProj === inputProject.toLowerCase();
+        const matchesPrev = prevResolved && curProj === prevResolved.toLowerCase();
+        if (matchesInput || matchesPrev) {
+          return { ...rec, project_name: newProject };
+        }
+        return rec;
+      })
+    );
+
+    // 2. Persist canonical mapping to backend (updates AttendanceRecord, debug_meta, ProjectAlias)
     try {
       const res = await fetch(`${API_URL}/api/records/project-alias`, {
         method: "POST",
@@ -375,8 +436,8 @@ export default function PreviewPage() {
         body: JSON.stringify({
           batch_id: batchId,
           input_project: inputProject,
-          resolved_project: resolvedProject
-        })
+          resolved_project: newProject,
+        }),
       });
       if (res.ok) {
         const refreshRes = await fetch(`${API_URL}/api/records/preview/${batchId}`, {
@@ -486,17 +547,22 @@ export default function PreviewPage() {
           <div className="flex items-center gap-3 flex-wrap">
             {/* Mode selector */}
             <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
-              {(["dry_run", "test", "production"] as const).map((m) => (
+              {([
+                { key: "count_only", label: "Count Only" },
+                { key: "dry_run", label: "Browser Dry Run" },
+                { key: "test", label: "Test (5)" },
+                { key: "production", label: "Production" },
+              ] as const).map(({ key, label }) => (
                 <button
-                  key={m}
-                  onClick={() => setMode(m)}
+                  key={key}
+                  onClick={() => setMode(key as SubmissionMode)}
                   className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                    mode === m
+                    mode === key
                       ? "bg-white dark:bg-slate-700 text-teal-600 dark:text-teal-400 shadow-sm"
                       : "text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
                   }`}
                 >
-                  {m === "dry_run" ? "Dry Run" : m === "test" ? "Test (5)" : "Production"}
+                  {label}
                 </button>
               ))}
             </div>
@@ -511,15 +577,21 @@ export default function PreviewPage() {
               {validating ? "Validating…" : "Validate Form"}
             </button>
 
-            {/* Submit button — only unlocks after validation passes */}
+            {/* Submit button — only unlocks after validation passes (or count_only) */}
             <button
               onClick={handleStartSubmission}
-              disabled={flowStatus !== "validated"}
-              title={flowStatus !== "validated" ? "Run 'Validate Form' first" : ""}
+              disabled={flowStatus !== "validated" && mode !== "count_only"}
+              title={flowStatus !== "validated" && mode !== "count_only" ? "Run 'Validate Form' first" : ""}
               className="px-5 py-2.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-xl flex items-center gap-2 transition-all active:scale-95 cursor-pointer shadow-md"
             >
               <Zap size={16} />
-              {mode === "dry_run" ? "Execute Dry Run" : "Approve & Submit"}
+              {mode === "count_only"
+                ? "Check Count (No Browser)"
+                : mode === "dry_run"
+                ? "Run Browser Dry Run"
+                : mode === "test"
+                ? "Test Submit (5)"
+                : "Approve & Submit"}
             </button>
           </div>
         )}
@@ -669,7 +741,9 @@ export default function PreviewPage() {
                       {debugMeta.project_resolution.map((res: any, idx: number) => (
                         <tr key={idx} className="hover:bg-slate-900/20 transition-colors">
                            <td className="py-3 px-4 font-semibold text-slate-300">{res.input_project}</td>
-                          <td className="py-3 px-4 text-slate-400 font-medium">{res.resolved_project}</td>
+                          <td className="py-3 px-4 text-slate-400 font-medium">
+                            {res.resolved_project || <span className="text-amber-400 italic">Unresolved (Select from dropdown)</span>}
+                          </td>
                           <td className="py-3 px-4 font-mono font-bold text-teal-400">{res.confidence}%</td>
                           <td className="py-3 px-4 text-slate-500 italic">{res.match_type}</td>
                           <td className="py-3 px-4">
@@ -683,21 +757,16 @@ export default function PreviewPage() {
                           </td>
                           <td className="py-3 px-4 text-right">
                             <select
-                              className="glass-input text-[11px] py-1.5 px-2.5 bg-slate-950 border border-slate-800 rounded-xl cursor-pointer max-w-[200px] text-slate-200 focus:outline-none focus:border-teal-500 bg-[#0f172a]"
-                              value={res.resolved_project}
+                              className={`glass-input text-[11px] py-1.5 px-2.5 bg-[#0f172a] border rounded-xl cursor-pointer max-w-[240px] text-slate-200 focus:outline-none focus:border-teal-500 ${
+                                !projectCatalog.includes(res.resolved_project) ? "border-amber-500/50" : "border-slate-800"
+                              }`}
+                              value={projectCatalog.includes(res.resolved_project) ? res.resolved_project : ""}
                               onChange={(e) => handleAliasMappingCorrection(res.input_project, e.target.value)}
                             >
-                              <option value="" className="bg-[#0f172a] text-slate-200">-- Correct Mapping --</option>
-                              {res.input_project && !projectCatalog.includes(res.input_project) && (
-                                <option value={res.input_project} className="bg-[#0f172a] text-slate-200">{res.input_project}</option>
-                              )}
-                              {res.resolved_project && !projectCatalog.includes(res.resolved_project) && res.resolved_project !== res.input_project && (
-                                <option value={res.resolved_project} className="bg-[#0f172a] text-slate-200">{res.resolved_project}</option>
-                              )}
+                              <option value="" className="bg-[#0f172a] text-slate-400">-- Select Project from Form --</option>
                               {projectCatalog.map((p) => (
                                 <option key={p} value={p} className="bg-[#0f172a] text-slate-200">{p}</option>
                               ))}
-
                             </select>
                           </td>
                         </tr>
@@ -922,13 +991,17 @@ export default function PreviewPage() {
               {(flowStatus === "submitting" || flowStatus === "completed" || flowStatus === "cancelled" || flowStatus === "failed") && liveStatus && (
                 <div className="space-y-5 flex-1 flex flex-col animate-in fade-in zoom-in-95 duration-300">
                   {/* KPIs */}
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className={`grid ${(liveStatus.needs_review || 0) > 0 ? "grid-cols-3" : "grid-cols-2"} gap-2`}>
                     <div className="bg-slate-100 dark:bg-slate-800/50 p-3 rounded-lg border border-slate-200 dark:border-slate-800">
                       <div className="flex items-center gap-1.5 text-teal-600 dark:text-teal-400 mb-1">
                         <Check size={14} />
-                        <span className="text-[10px] font-bold uppercase tracking-wider">Submitted</span>
+                        <span className="text-[10px] font-bold uppercase tracking-wider">
+                          {liveStatus.dry_run_verified && liveStatus.submitted === 0 ? "Verified" : "Submitted"}
+                        </span>
                       </div>
-                      <span className="text-2xl font-bold text-slate-800 dark:text-white">{liveStatus.submitted}</span>
+                      <span className="text-2xl font-bold text-slate-800 dark:text-white">
+                        {liveStatus.submitted > 0 ? liveStatus.submitted : (liveStatus.dry_run_verified || 0)}
+                      </span>
                     </div>
                     <div className="bg-slate-100 dark:bg-slate-800/50 p-3 rounded-lg border border-slate-200 dark:border-slate-800">
                       <div className="flex items-center gap-1.5 text-rose-600 dark:text-rose-400 mb-1">
@@ -937,6 +1010,15 @@ export default function PreviewPage() {
                       </div>
                       <span className="text-2xl font-bold text-slate-800 dark:text-white">{liveStatus.failed}</span>
                     </div>
+                    {(liveStatus.needs_review || 0) > 0 && (
+                      <div className="bg-amber-50 dark:bg-amber-950/30 p-3 rounded-lg border border-amber-300 dark:border-amber-800/50">
+                        <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 mb-1">
+                          <AlertTriangle size={14} />
+                          <span className="text-[10px] font-bold uppercase tracking-wider">Review</span>
+                        </div>
+                        <span className="text-2xl font-bold text-amber-700 dark:text-amber-300">{liveStatus.needs_review}</span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Progress Bar */}
@@ -961,7 +1043,7 @@ export default function PreviewPage() {
                       />
                     </div>
                     <div className="text-xs text-slate-500 text-right">
-                      {liveStatus.submitted + liveStatus.failed} / {liveStatus.total} processed
+                      {(liveStatus.submitted > 0 ? liveStatus.submitted : (liveStatus.dry_run_verified || 0)) + liveStatus.failed + (liveStatus.needs_review || 0)} / {liveStatus.total} processed
                     </div>
                   </div>
 
@@ -975,7 +1057,11 @@ export default function PreviewPage() {
                       {liveStatus.logs.map((log, i) => (
                         <div key={i} className="flex gap-2 leading-relaxed">
                           <span className="text-slate-600">❯</span>
-                          <span className={`opacity-90 ${log.includes("[ERROR]") ? "text-rose-400" : log.includes("[DRY") ? "text-slate-300" : ""}`}>
+                          <span className={`opacity-90 ${
+                            log.includes("[ERROR]") ? "text-rose-400" :
+                            log.includes("[NEEDS REVIEW]") ? "text-amber-400 font-semibold" :
+                            log.includes("[DRY") || log.includes("[COUNT") ? "text-teal-300" : ""
+                          }`}>
                             {log}
                           </span>
                         </div>
